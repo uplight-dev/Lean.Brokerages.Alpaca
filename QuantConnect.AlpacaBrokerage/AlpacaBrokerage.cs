@@ -729,7 +729,6 @@ namespace QuantConnect.Brokerages.Alpaca
             return _symbolMapper.SupportedSecurityType.Contains(symbol.SecurityType);
         }
 
-
         private class SubscriptionEntry
         {
             public Symbol Symbol { get; set; }
