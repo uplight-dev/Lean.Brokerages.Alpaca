@@ -29,16 +29,22 @@ namespace QuantConnect.Brokerages.Alpaca;
 public partial class AlpacaBrokerage
 {
     /// <summary>
+    /// Indicates whether querying recent SIP (Securities Information Processor) data  
+    /// is restricted due to subscription limitations.
+    /// </summary>
+    private bool _isSipDataRestricted;
+
+    /// <summary>
+    /// Indicates whether OPRA (Options Price Reporting Authority) data is restricted  
+    /// due to the OPRA agreement not being signed, leading to a 15-minute delay.
+    /// </summary>
+    private bool _isOpraDataRestricted;
+
+    /// <summary>
     /// Flag to ensure the warning message of <see cref="SecurityType.Equity"/> symbol for unsupported <see cref="TickType.Trade"/>
     /// <seealso cref="Resolution.Tick"/> and <seealso cref="Resolution.Second"/> is only logged once.
     /// </summary>
     private bool _unsupportedEquityTradeTickAndSecondResolution;
-
-    /// <summary>
-    /// Flag to ensure the warning message for unsupported <see cref="TickType.OpenInterest"/> resolutions
-    /// other than <seealso cref="Resolution.Tick"/> is only logged once.
-    /// </summary>
-    private bool _unsupportedOpenInterestNonTickResolution;
 
     /// <summary>
     /// Flag to ensure the warning message for unsupported <see cref="SecurityType.Option"/> <seealso cref="TickType"/> is only logged once.
@@ -54,6 +60,11 @@ public partial class AlpacaBrokerage
     /// Indicates whether a warning message for unsupported <see cref="SecurityType"/> types has been logged.
     /// </summary>
     private bool _unsupportedSecurityTypeWarningLogged;
+
+    /// <summary>
+    /// Indicates whether a warning for an invalid start time has been logged, where the start time is greater than or equal to the end time in UTC.
+    /// </summary>
+    private volatile bool _invalidStartTimeWarningLogged;
 
     /// <summary>
     /// Gets the history for the requested symbols
@@ -75,6 +86,17 @@ public partial class AlpacaBrokerage
         }
 
         var brokerageSymbol = _symbolMapper.GetBrokerageSymbol(request.Symbol);
+
+        if (request.StartTimeUtc >= request.EndTimeUtc)
+        {
+            if (!_invalidStartTimeWarningLogged)
+            {
+                _invalidStartTimeWarningLogged = true;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "InvalidStarTimeUtc",
+                    "The history request's start time must be earlier than the end time. No data will be returned."));
+            }
+            return null;
+        }
 
         IEnumerable<BaseData> data;
         switch (request.Symbol.SecurityType)
@@ -218,7 +240,7 @@ public partial class AlpacaBrokerage
     private IEnumerable<Tick> GetGenericHistoricalQuoteTick<T>(HistoryRequest leanRequest, string brokerageSymbol, IHistoricalQuotesClient<T> client, T alpacaRequest)
         where T : IHistoricalRequest<T, IQuote>
     {
-        foreach (var response in CreatePaginationRequest(alpacaRequest, req => client.GetHistoricalQuotesAsync(alpacaRequest)))
+        foreach (var response in CreatePaginationRequest(alpacaRequest, req => client.GetHistoricalQuotesAsync(req)))
         {
             foreach (var quote in response.Items[brokerageSymbol])
             {
@@ -236,7 +258,7 @@ public partial class AlpacaBrokerage
     private IEnumerable<Tick> GetGenericHistoricalTradeTick<T>(HistoryRequest leanRequest, string brokerageSymbol, IHistoricalTradesClient<T> client, T alpacaRequest)
         where T : IHistoricalRequest<T, ITrade>
     {
-        foreach (var response in CreatePaginationRequest(alpacaRequest, req => client.GetHistoricalTradesAsync(alpacaRequest)))
+        foreach (var response in CreatePaginationRequest(alpacaRequest, req => client.GetHistoricalTradesAsync(req)))
         {
             foreach (var trade in response.Items[brokerageSymbol])
             {
@@ -266,29 +288,47 @@ public partial class AlpacaBrokerage
     }
 
     /// <summary>
-    /// Creates a pagination request for a given request object, using a callback function
-    /// to asynchronously fetch paginated results until all pages are retrieved.
+    /// Creates a pagination request for historical data based on the given request and callback function.
     /// </summary>
-    /// <typeparam name="T">The type of request object that implements <see cref="IHistoricalRequest"/>.</typeparam>
-    /// <typeparam name="U">The type of elements contained in each page of the response implementing <see cref="IMultiPage{U}"/>.</typeparam>
-    /// <param name="request">The request object specifying the pagination parameters.</param>
-    /// <param name="callback">The asynchronous function callback that fetches a page of results.</param>
-    /// <param name="paginationSize">The maximum number of items per page (default is 10,000).</param>
-    /// <returns>An enumerable sequence of paginated responses, each implementing <see cref="IMultiPage{U}"/>.</returns>
-    /// <remarks>
-    /// This method iterates over pages of results until there are no more pages to retrieve,
-    /// using the <paramref name="callback"/> function to fetch each page asynchronously.
-    /// It assumes that the <paramref name="request"/> object has pagination settings configured,
-    /// and it updates the <paramref name="request"/> object with the next page token after each retrieval.
-    /// </remarks>
-    /// <exception cref="ArgumentNullException">Thrown when <paramref name="request"/> or <paramref name="callback"/> is null.</exception>
+    /// <typeparam name="T">The type of the historical request (must implement IHistoricalRequest).</typeparam>
+    /// <typeparam name="U">The type of the data being returned in the paginated response.</typeparam>
+    /// <param name="request">The request object that contains the pagination parameters.</param>
+    /// <param name="callback">A callback function that performs the API request and returns a paginated result.</param>
+    /// <param name="paginationSize">The size of each page of results. Defaults to 10,000.</param>
+    /// <returns>An enumerable of paginated responses, yielding one page at a time.</returns>
     private IEnumerable<IMultiPage<U>> CreatePaginationRequest<T, U>(T request, Func<T, Task<IMultiPage<U>>> callback, uint paginationSize = 10_000)
-        where T : IHistoricalRequest
+    where T : IHistoricalRequest
     {
-        request.Pagination.Size = paginationSize;
+        var response = default(IMultiPage<U>);
+        var repeatByRestrictException = default(bool);
         do
         {
-            var response = callback(request).SynchronouslyAwaitTaskResult();
+            repeatByRestrictException = false;
+            // If the token is null, it indicates the first request; otherwise, it's a subsequent page.
+            if ((_isSipDataRestricted || _isOpraDataRestricted) && !IsCryptoRequest(request) && string.IsNullOrEmpty(request.Pagination.Token))
+            {
+                try
+                {
+                    request = (T)ChangeIntoTimeIntervalInHistoricalRequest(request);
+                }
+                catch (ArgumentException)
+                {
+                    break;
+                }
+            }
+
+            try
+            {
+                request.Pagination.Size ??= paginationSize;
+                response = callback(request).SynchronouslyAwaitTaskResult();
+            }
+            catch (RestClientErrorException ex) when (HandleHistoricalFreeRestrictionException(ex.Message, out var messageType, out var messageText))
+            {
+                repeatByRestrictException = true;
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, messageType, messageText));
+                continue;
+            }
+
             if (response.Items.Count == 0)
             {
                 continue;
@@ -296,6 +336,68 @@ public partial class AlpacaBrokerage
 
             yield return response;
             request.Pagination.Token = response.NextPageToken;
-        } while (!string.IsNullOrEmpty(request.Pagination.Token));
+        } while (!string.IsNullOrEmpty(request.Pagination.Token) || repeatByRestrictException);
+    }
+
+    /// <summary>
+    /// Handles specific SIP restriction exceptions and returns appropriate warning messages.
+    /// </summary>
+    private bool HandleHistoricalFreeRestrictionException(string message, out string messageType, out string messageText)
+    {
+        switch (message.ToLowerInvariant())
+        {
+            case "opra agreement is not signed":
+                _isOpraDataRestricted = true;
+                messageType = "OPRADataRestriction";
+                messageText = "OPRA agreement is not signed for free subscriptions. Historical data will have a 15-minute delay.";
+                return true;
+
+            case "subscription does not permit querying recent sip data":
+                _isSipDataRestricted = true;
+                messageType = "SIPDataRestriction";
+                messageText = "Real-time SIP data is restricted for free subscriptions. Historical data will have a 15-minute delay.";
+                return true;
+
+            default:
+                messageType = null;
+                messageText = null;
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Determines whether the given historical request is related to cryptocurrency data.
+    /// </summary>
+    /// <param name="historicalRequest">The historical request object.</param>
+    /// <returns><c>true</c> if the request is for cryptocurrency data; otherwise, <c>false</c>.</returns>
+    private bool IsCryptoRequest(IHistoricalRequest historicalRequest) =>
+        historicalRequest is HistoricalCryptoBarsRequest or HistoricalCryptoQuotesRequest or HistoricalCryptoTradesRequest;
+
+    /// <summary>
+    /// Adjusts the time interval in a historical request to account for restricted SIP data access.
+    /// </summary>
+    /// <param name="historicalRequest">The original historical request object.</param>
+    /// <returns>A new historical request with the adjusted time range.</returns>
+    /// <exception cref="NotImplementedException">Thrown if the request type is not handled.</exception>
+    /// <exception cref="ArgumentException">Thrown if the adjusted time range is invalid.</exception>
+    private IHistoricalRequest ChangeIntoTimeIntervalInHistoricalRequest(IHistoricalRequest historicalRequest)
+    {
+        var end = DateTime.UtcNow.AddMinutes(-15);
+        var start = (historicalRequest as HistoricalRequestBase).TimeInterval.From.Value;
+
+        if (start >= end)
+        {
+            throw new ArgumentException($"{nameof(AlpacaBrokerage)}.{nameof(ChangeIntoTimeIntervalInHistoricalRequest)}: Invalid time range: SIP's 15-minute delay may cause end time to fall before start, especially across trading days. Adjust accordingly.");
+        }
+
+        return historicalRequest switch
+        {
+            HistoricalBarsRequest hbr when _isSipDataRestricted => new HistoricalBarsRequest(hbr.Symbols, start, end, hbr.TimeFrame),
+            HistoricalQuotesRequest hqr when _isSipDataRestricted => new HistoricalQuotesRequest(hqr.Symbols, start, end),
+            HistoricalOptionTradesRequest hor when _isOpraDataRestricted => new HistoricalOptionTradesRequest(hor.Symbols, start, end),
+            HistoricalOptionBarsRequest hobr when _isOpraDataRestricted => new HistoricalOptionBarsRequest(hobr.Symbols, start, end, hobr.TimeFrame),
+            _ when _isOpraDataRestricted || _isSipDataRestricted => historicalRequest,
+            _ => throw new NotImplementedException($"{nameof(AlpacaBrokerage)}.{nameof(ChangeIntoTimeIntervalInHistoricalRequest)}: The historical request type '{historicalRequest.GetType().FullName}' is not implemented."),
+        };
     }
 }
